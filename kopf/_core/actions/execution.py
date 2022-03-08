@@ -99,9 +99,12 @@ class HandlerState:
     carried over for logging of counts/extras, and for final state purging,
     but not participating in the current handling cycle.
     """
-    started: Optional[datetime.datetime] = None  # None means this information was lost.
-    stopped: Optional[datetime.datetime] = None  # None means it is still running (e.g. delayed).
-    delayed: Optional[datetime.datetime] = None  # None means it is finished (succeeded/failed).
+    # started: Optional[datetime.datetime] = None  # None means this information was lost.
+    # stopped: Optional[datetime.datetime] = None  # None means it is still running (e.g. delayed).
+    # delayed: Optional[datetime.datetime] = None  # None means it is finished (succeeded/failed).
+    # started: Optional[float] = None  # None means this information was lost.
+    # stopped: Optional[float] = None  # None means it is still running (e.g. delayed).
+    # delayed: Optional[float] = None  # None means it is finished (succeeded/failed).
     retries: int = 0
     success: bool = False
     failure: bool = False
@@ -112,9 +115,7 @@ class HandlerState:
 
     @property
     def sleeping(self) -> bool:
-        ts = self.delayed
-        now = datetime.datetime.utcnow()
-        return not self.finished and ts is not None and ts > now
+        raise NotImplementedError()
 
     @property
     def awakened(self) -> bool:
@@ -122,8 +123,11 @@ class HandlerState:
 
     @property
     def runtime(self) -> datetime.timedelta:
-        now = datetime.datetime.utcnow()
-        return now - (self.started if self.started else now)
+        raise NotImplementedError()
+
+    @property
+    def started_as_datetime(self) -> datetime.datetime:
+        raise NotImplementedError()
 
 
 class State(Mapping[ids.HandlerId, HandlerState]):
@@ -266,13 +270,17 @@ async def execute_handler_once(
     # Mutable accumulator for all the sub-handlers of any level deep; populated in `kopf.execute`.
     subrefs: Set[ids.HandlerId] = set()
 
+    # Prevent extra cycles and time wasted if we know right now that it will fail the next time.
+    the_last_try = handler.retries is not None and state.retries + 1 >= handler.retries
+
     # The exceptions are handled locally and are not re-raised, to keep the operator running.
     try:
         logger.debug(f"{handler} is invoked.")
 
+        # Strict checks, contrary to the look-ahead checks below, which are approximate.
+        # The extra actual time could be added by e.g. operator or cluster downtime.
         if handler.timeout is not None and state.runtime.total_seconds() >= handler.timeout:
             raise HandlerTimeoutError(f"{handler} has timed out after {state.runtime}.")
-
         if handler.retries is not None and state.retries >= handler.retries:
             raise HandlerRetriesError(f"{handler} has exceeded {state.retries} retries.")
 
@@ -280,7 +288,7 @@ async def execute_handler_once(
             handler=handler,
             cause=cause,
             retry=state.retries,
-            started=state.started or datetime.datetime.utcnow(),  # "or" is for type-checking.
+            started=state.started_as_datetime,
             runtime=state.runtime,
             settings=settings,
             lifecycle=lifecycle,  # just a default for the sub-handlers, not used directly.
@@ -300,11 +308,26 @@ async def execute_handler_once(
 
     # Definitely a temporary error, regardless of the error strictness.
     except TemporaryError as e:
-        logger.error(f"{handler} failed temporarily: {str(e) or repr(e)}")
-        return Outcome(final=False, exception=e, delay=e.delay, subrefs=subrefs)
+        # Maybe false-negative, never false-positive checks to prevent extra cycles & time wasted.
+        lookahead_runtime = (state.runtime + datetime.timedelta(seconds=e.delay)).total_seconds()
+        lookahead_timeout = handler.timeout is not None and lookahead_runtime >= handler.timeout
+        lookahead_retries = handler.retries is not None and state.retries + 1 >= handler.retries
+        if lookahead_timeout:
+            exc = HandlerTimeoutError(f"{handler} failed temporarily but would time out after "
+                                      f"{handler.timeout} seconds: {str(e) or repr(e)}")
+            logger.error(f"{exc}")  # already formatted
+            return Outcome(final=True, exception=exc, subrefs=subrefs)
+        elif lookahead_retries:
+            exc = HandlerRetriesError(f"{handler} failed temporarily but would exceed "
+                                      f"{handler.retries} retries: {str(e) or repr(e)}")
+            logger.error(f"{exc}")  # already formatted
+            return Outcome(final=True, exception=exc, subrefs=subrefs)
+        else:
+            logger.error(f"{handler} failed temporarily: {str(e) or repr(e)}")
+            return Outcome(final=the_last_try, exception=e, delay=e.delay, subrefs=subrefs)
 
     # Same as permanent errors below, but with better logging for our internal cases.
-    except HandlerTimeoutError as e:
+    except (HandlerTimeoutError, HandlerRetriesError) as e:
         logger.error(f"{str(e) or repr(e)}")  # already formatted
         return Outcome(final=True, exception=e, subrefs=subrefs)
         # TODO: report the handling failure somehow (beside logs/events). persistent status?
@@ -317,9 +340,23 @@ async def execute_handler_once(
 
     # Regular errors behave as either temporary or permanent depending on the error strictness.
     except Exception as e:
+        # Maybe false-negative, never false-positive checks to prevent extra cycles & time wasted.
+        lookahead_runtime = (state.runtime + datetime.timedelta(seconds=backoff)).total_seconds()
+        lookahead_timeout = handler.timeout is not None and lookahead_runtime > handler.timeout
+        lookahead_retries = handler.retries is not None and state.retries + 1 > handler.retries
         if errors_mode == ErrorsMode.IGNORED:
             logger.exception(f"{handler} failed with an exception. Will ignore.")
             return Outcome(final=True, subrefs=subrefs)
+        elif errors_mode == ErrorsMode.TEMPORARY and lookahead_timeout:
+            exc = HandlerTimeoutError(f"{handler} failed with an exception but would time out after "
+                                      f"{handler.timeout} seconds: {str(e) or repr(e)}")
+            logger.exception(f"{exc}")  # already formatted
+            return Outcome(final=True, exception=exc, subrefs=subrefs)
+        elif errors_mode == ErrorsMode.TEMPORARY and lookahead_retries:
+            exc = HandlerRetriesError(f"{handler} failed with an exception but would exceed "
+                                      f"{handler.retries} retries: {str(e) or repr(e)}")
+            logger.exception(f"{exc}")  # already formatted
+            return Outcome(final=True, exception=exc, subrefs=subrefs)
         elif errors_mode == ErrorsMode.TEMPORARY:
             logger.exception(f"{handler} failed with an exception. Will retry.")
             return Outcome(final=False, exception=e, delay=backoff, subrefs=subrefs)

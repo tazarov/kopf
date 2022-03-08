@@ -227,7 +227,8 @@ def k8s_mocked(mocker, resp_mocker):
         patch=mocker.patch('kopf._cogs.clients.api.patch', return_value={}),
         delete=mocker.patch('kopf._cogs.clients.api.delete', return_value={}),
         stream=mocker.patch('kopf._cogs.clients.api.stream', side_effect=itr),
-        sleep=mocker.patch('kopf._cogs.aiokits.aiotime.sleep', return_value=None),
+        sleep=None,
+        # sleep=mocker.patch('kopf._cogs.aiokits.aiotime.sleep', return_value=None),
     )
 
 

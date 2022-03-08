@@ -190,7 +190,7 @@ async def stop_daemons(
     for daemon in list(daemons.values()):
         logger = daemon.logger
         stopper = daemon.stopper
-        age = (now - (stopper.when or now))
+        age = (now - (stopper.when if stopper.when is not None else now))
 
         handler = daemon.handler
         if isinstance(handler, handlers_.DaemonHandler):

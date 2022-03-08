@@ -9,8 +9,27 @@ high-level kopf-event (a cause). The handlers are called at different times,
 and the overall handling routine should persist the handler status somewhere.
 
 The states are persisted in a state storage: see `kopf._cogs.configs.progress`.
-"""
 
+For testability, the states present the time internally as a number of seconds
+since the event loop's time-zero (or before that, if negative). These internal
+time values are never exposed to users and are never persisted in the storage.
+Even the UTC value of "time-zero" is calculated only when parsing or rendering
+the ISO-format time strings and is not used anywhere else.
+
+To compensate for floating-point precision errors, the internal time is rounded
+to microseconds on the (+/-) math operations (a couple places only).
+In the worst imaginary case of an operator process running for 365 days
+uninterrupted (which is unlikely), the range of values is around 32 mln
+and does not impose any problem even for the microsecond precision::
+
+          31_536_000.001_002 + 3.45     == 31536003.451001998   # a problem
+    round(31_536_000.001_002 + 3.45, 6) == 31536003.451002      # no problem
+
+Most of the in-memory handlers —daemons, timers, activities— benefit from this
+since they never need the UTC wall-clock time normally. The persisted handlers
+can calculate the relevant UTC wall-clock time when persisted/restored.
+"""
+import asyncio
 import collections.abc
 import copy
 import dataclasses
@@ -39,9 +58,9 @@ class HandlerState(execution.HandlerState):
 
     # Some fields may overlap the base class's fields, but this is fine (the types are the same).
     active: Optional[bool] = None  # is it used in done/delays [T]? or only in counters/purges [F]?
-    started: Optional[datetime.datetime] = None  # None means this information was lost.
-    stopped: Optional[datetime.datetime] = None  # None means it is still running (e.g. delayed).
-    delayed: Optional[datetime.datetime] = None  # None means it is finished (succeeded/failed).
+    started: Optional[float] = None  # None means this information was lost.
+    stopped: Optional[float] = None  # None means it is still running (e.g. delayed).
+    delayed: Optional[float] = None  # None means it is finished (succeeded/failed).
     purpose: Optional[str] = None  # None is a catch-all marker for upgrades/rollbacks.
     retries: int = 0
     success: bool = False
@@ -50,11 +69,29 @@ class HandlerState(execution.HandlerState):
     subrefs: Collection[ids.HandlerId] = ()  # ids of actual sub-handlers of all levels deep.
     _origin: Optional[progress.ProgressRecord] = None  # to check later if it has actually changed.
 
+    @property
+    def sleeping(self) -> bool:
+        now = asyncio.get_running_loop().time()
+        return not self.finished and self.delayed is not None and self.delayed > now
+
+    @property
+    def runtime(self) -> datetime.timedelta:
+        # Note: in case the started time is lost (an impossible case), the runtime is always zero.
+        now = asyncio.get_running_loop().time()
+        runtime = now - (self.started if self.started is not None else now)
+        return datetime.timedelta(seconds=round(runtime, 6))
+
+    @property
+    def started_as_datetime(self) -> datetime.datetime:
+        looptime = asyncio.get_running_loop().time()
+        basetime = datetime.datetime.utcnow() - datetime.timedelta(seconds=looptime)
+        return basetime + datetime.timedelta(seconds=self.started or 0)  # "or" is for type-checking
+
     @classmethod
     def from_scratch(cls, *, purpose: Optional[str] = None) -> "HandlerState":
         return cls(
             active=True,
-            started=datetime.datetime.utcnow(),
+            started=asyncio.get_running_loop().time(),
             purpose=purpose,
         )
 
@@ -62,9 +99,9 @@ class HandlerState(execution.HandlerState):
     def from_storage(cls, __d: progress.ProgressRecord) -> "HandlerState":
         return cls(
             active=False,
-            started=_datetime_fromisoformat(__d.get('started')) or datetime.datetime.utcnow(),
-            stopped=_datetime_fromisoformat(__d.get('stopped')),
-            delayed=_datetime_fromisoformat(__d.get('delayed')),
+            started=_parse_iso8601(__d.get('started')) or asyncio.get_running_loop().time(),
+            stopped=_parse_iso8601(__d.get('stopped')),
+            delayed=_parse_iso8601(__d.get('delayed')),
             purpose=__d.get('purpose') if __d.get('purpose') else None,
             retries=__d.get('retries') or 0,
             success=__d.get('success') or False,
@@ -76,9 +113,9 @@ class HandlerState(execution.HandlerState):
 
     def for_storage(self) -> progress.ProgressRecord:
         return progress.ProgressRecord(
-            started=None if self.started is None else _datetime_toisoformat(self.started),
-            stopped=None if self.stopped is None else _datetime_toisoformat(self.stopped),
-            delayed=None if self.delayed is None else _datetime_toisoformat(self.delayed),
+            started=None if self.started is None else _format_iso8601(self.started),
+            stopped=None if self.stopped is None else _format_iso8601(self.stopped),
+            delayed=None if self.delayed is None else _format_iso8601(self.delayed),
             purpose=None if self.purpose is None else str(self.purpose),
             retries=None if self.retries is None else int(self.retries),
             success=None if self.success is None else bool(self.success),
@@ -104,14 +141,14 @@ class HandlerState(execution.HandlerState):
             self,
             outcome: execution.Outcome,
     ) -> "HandlerState":
-        now = datetime.datetime.utcnow()
+        now = asyncio.get_running_loop().time()
         cls = type(self)
         return cls(
             active=self.active,
             purpose=self.purpose,
-            started=self.started if self.started else now,
-            stopped=self.stopped if self.stopped else now if outcome.final else None,
-            delayed=now + datetime.timedelta(seconds=outcome.delay) if outcome.delay is not None else None,
+            started=self.started if self.started is not None else now,
+            stopped=self.stopped if self.stopped is not None else now if outcome.final else None,
+            delayed=round(now + outcome.delay, 6) if outcome.delay is not None else None,
             success=bool(outcome.final and outcome.exception is None),
             failure=bool(outcome.final and outcome.exception is not None),
             retries=(self.retries if self.retries is not None else 0) + 1,
@@ -313,9 +350,9 @@ class State(execution.State):
         processing routine, based on all delays of different origin:
         e.g. postponed daemons, stopping daemons, temporarily failed handlers.
         """
-        now = datetime.datetime.utcnow()
+        now = asyncio.get_running_loop().time()
         return [
-            max(0, (handler_state.delayed - now).total_seconds()) if handler_state.delayed else 0
+            max(0.0, round(handler_state.delayed - now, 6)) if handler_state.delayed else 0
             for handler_state in self._states.values()
             if handler_state.active and not handler_state.finished
         ]
@@ -355,30 +392,34 @@ def deliver_results(
 
 
 @overload
-def _datetime_toisoformat(val: None) -> None: ...
+def _format_iso8601(val: None) -> None: ...
 
 
 @overload
-def _datetime_toisoformat(val: datetime.datetime) -> str: ...
+def _format_iso8601(val: float) -> str: ...
 
 
-def _datetime_toisoformat(val: Optional[datetime.datetime]) -> Optional[str]:
+def _format_iso8601(val: Optional[float]) -> Optional[str]:
     if val is None:
         return None
     else:
-        return val.isoformat(timespec='microseconds')
+        looptime = asyncio.get_running_loop().time()
+        basetime = datetime.datetime.utcnow() - datetime.timedelta(seconds=looptime)
+        return (basetime + datetime.timedelta(seconds=val)).isoformat(timespec='microseconds')
 
 
 @overload
-def _datetime_fromisoformat(val: None) -> None: ...
+def _parse_iso8601(val: None) -> None: ...
 
 
 @overload
-def _datetime_fromisoformat(val: str) -> datetime.datetime: ...
+def _parse_iso8601(val: str) -> float: ...
 
 
-def _datetime_fromisoformat(val: Optional[str]) -> Optional[datetime.datetime]:
+def _parse_iso8601(val: Optional[str]) -> Optional[float]:
     if val is None:
         return None
     else:
-        return datetime.datetime.fromisoformat(val)
+        looptime = asyncio.get_running_loop().time()
+        basetime = datetime.datetime.utcnow() - datetime.timedelta(seconds=looptime)
+        return (datetime.datetime.fromisoformat(val) - basetime).total_seconds()
