@@ -55,6 +55,7 @@ class HandlerState(execution.HandlerState):
     carried over for logging of counts/extras, and for final state purging,
     but not participating in the current handling cycle.
     """
+    _basetime: datetime.datetime
 
     # Some fields may overlap the base class's fields, but this is fine (the types are the same).
     active: Optional[bool] = None  # is it used in done/delays [T]? or only in counters/purges [F]?
@@ -83,25 +84,37 @@ class HandlerState(execution.HandlerState):
 
     @property
     def started_as_datetime(self) -> datetime.datetime:
-        looptime = asyncio.get_running_loop().time()
-        basetime = datetime.datetime.utcnow() - datetime.timedelta(seconds=looptime)
-        return basetime + datetime.timedelta(seconds=self.started or 0)  # "or" is for type-checking
+        return self._basetime + datetime.timedelta(seconds=self.started or 0)  # "or" is for type-checking
+
+    @property
+    def delayed_as_datetime(self) -> datetime.datetime:
+        return self._basetime + datetime.timedelta(seconds=self.delayed or 0)  # "or" is for type-checking
 
     @classmethod
     def from_scratch(cls, *, purpose: Optional[str] = None) -> "HandlerState":
+        # Beware: utcnow() changes across calls, so we fix the base time by getting it only once.
+        # The "base time" is used for stable wall-clock ↔ ︎loop-clock conversion and has no meaning.
+        looptime = asyncio.get_running_loop().time()
+        basetime = datetime.datetime.utcnow() - datetime.timedelta(seconds=looptime)
         return cls(
+            _basetime=basetime,
             active=True,
-            started=asyncio.get_running_loop().time(),
+            started=looptime,
             purpose=purpose,
         )
 
     @classmethod
     def from_storage(cls, __d: progress.ProgressRecord) -> "HandlerState":
+        # Beware: utcnow() changes across calls, so we fix the base time by getting it only once.
+        # The "base time" is used for stable wall-clock ↔ ︎loop-clock conversion and has no meaning.
+        looptime = asyncio.get_running_loop().time()
+        basetime = datetime.datetime.utcnow() - datetime.timedelta(seconds=looptime)
         return cls(
+            _basetime=basetime,
             active=False,
-            started=_parse_iso8601(__d.get('started')) or asyncio.get_running_loop().time(),
-            stopped=_parse_iso8601(__d.get('stopped')),
-            delayed=_parse_iso8601(__d.get('delayed')),
+            started=parse_iso8601(__d.get('started'), basetime) or looptime,
+            stopped=parse_iso8601(__d.get('stopped'), basetime),
+            delayed=parse_iso8601(__d.get('delayed'), basetime),
             purpose=__d.get('purpose') if __d.get('purpose') else None,
             retries=__d.get('retries') or 0,
             success=__d.get('success') or False,
@@ -113,9 +126,9 @@ class HandlerState(execution.HandlerState):
 
     def for_storage(self) -> progress.ProgressRecord:
         return progress.ProgressRecord(
-            started=None if self.started is None else _format_iso8601(self.started),
-            stopped=None if self.stopped is None else _format_iso8601(self.stopped),
-            delayed=None if self.delayed is None else _format_iso8601(self.delayed),
+            started=None if self.started is None else format_iso8601(self.started, self._basetime),
+            stopped=None if self.stopped is None else format_iso8601(self.stopped, self._basetime),
+            delayed=None if self.delayed is None else format_iso8601(self.delayed, self._basetime),
             purpose=None if self.purpose is None else str(self.purpose),
             retries=None if self.retries is None else int(self.retries),
             success=None if self.success is None else bool(self.success),
@@ -144,6 +157,7 @@ class HandlerState(execution.HandlerState):
         now = asyncio.get_running_loop().time()
         cls = type(self)
         return cls(
+            _basetime=self._basetime,
             active=self.active,
             purpose=self.purpose,
             started=self.started if self.started is not None else now,
@@ -350,6 +364,10 @@ class State(execution.State):
         processing routine, based on all delays of different origin:
         e.g. postponed daemons, stopping daemons, temporarily failed handlers.
         """
+        # TODO: a big problem: state is now loop-dependent, it cannot run outside of it.
+        #       all tests must be base `async def`. Which is fine for us.
+        #       though, keeping the state simple (non-asyncio-dependent) could be good too.
+        #   ?=> is there a way to use some other time?
         now = asyncio.get_running_loop().time()
         return [
             max(0.0, round(handler_state.delayed - now, 6)) if handler_state.delayed else 0
@@ -392,34 +410,30 @@ def deliver_results(
 
 
 @overload
-def _format_iso8601(val: None) -> None: ...
+def format_iso8601(val: None, basetime: datetime.datetime) -> None: ...
 
 
 @overload
-def _format_iso8601(val: float) -> str: ...
+def format_iso8601(val: float, basetime: datetime.datetime) -> str: ...
 
 
-def _format_iso8601(val: Optional[float]) -> Optional[str]:
+def format_iso8601(val: Optional[float], basetime: datetime.datetime) -> Optional[str]:
     if val is None:
         return None
     else:
-        looptime = asyncio.get_running_loop().time()
-        basetime = datetime.datetime.utcnow() - datetime.timedelta(seconds=looptime)
         return (basetime + datetime.timedelta(seconds=val)).isoformat(timespec='microseconds')
 
 
 @overload
-def _parse_iso8601(val: None) -> None: ...
+def parse_iso8601(val: None, basetime: datetime.datetime) -> None: ...
 
 
 @overload
-def _parse_iso8601(val: str) -> float: ...
+def parse_iso8601(val: str, basetime: datetime.datetime) -> float: ...
 
 
-def _parse_iso8601(val: Optional[str]) -> Optional[float]:
+def parse_iso8601(val: Optional[str], basetime: datetime.datetime) -> Optional[float]:
     if val is None:
         return None
     else:
-        looptime = asyncio.get_running_loop().time()
-        basetime = datetime.datetime.utcnow() - datetime.timedelta(seconds=looptime)
         return (datetime.datetime.fromisoformat(val) - basetime).total_seconds()

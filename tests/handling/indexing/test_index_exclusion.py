@@ -76,9 +76,9 @@ async def test_temporary_failures_with_expired_delays_are_reindexed(
         resource, namespace, settings, registry, memories, indexers, index, caplog, event_type, handlers):
     caplog.set_level(logging.DEBUG)
     body = {'metadata': {'namespace': namespace, 'name': 'name1'}}
-    delayed = datetime.datetime(2020, 12, 31, 23, 59, 59, 0)
+    delayed = '2020-12-31T23:59:59.000000'
     memory = await memories.recall(raw_body=body)
-    memory.indexing_memory.indexing_state = State({'index_fn': HandlerState(delayed=delayed)})
+    memory.indexing_memory.indexing_state = State({'index_fn': HandlerState.from_storage(dict(delayed=delayed))})
     await process_resource_event(
         lifecycle=all_at_once,
         registry=registry,
@@ -91,6 +91,7 @@ async def test_temporary_failures_with_expired_delays_are_reindexed(
         event_queue=asyncio.Queue(),
         resource_indexed=Toggle(),  # used! only to enable indexing.
     )
+    print(repr(caplog.messages))
     assert handlers.index_mock.call_count == 1
 
 
@@ -156,7 +157,7 @@ async def test_removed_and_remembered_on_permanent_errors(
     (dict(), datetime.datetime(2020, 12, 31, 0, 1, 0)),
     (dict(delay=0), datetime.datetime(2020, 12, 31, 0, 0, 0)),
     (dict(delay=9), datetime.datetime(2020, 12, 31, 0, 0, 9)),
-    (dict(delay=None), None),
+    (dict(delay=None), datetime.datetime(2020, 12, 31, 0, 0, 0)),
 ])
 @pytest.mark.usefixtures('indexed_123')
 @pytest.mark.parametrize('event_type', EVENT_TYPES_WHEN_EXISTS)
@@ -184,7 +185,7 @@ async def test_removed_and_remembered_on_temporary_errors(
     assert memory.indexing_memory.indexing_state['index_fn'].failure == False
     assert memory.indexing_memory.indexing_state['index_fn'].success == False
     assert memory.indexing_memory.indexing_state['index_fn'].message == 'boo!'
-    assert memory.indexing_memory.indexing_state['index_fn'].delayed == expected_delayed
+    assert memory.indexing_memory.indexing_state['index_fn'].delayed_as_datetime == expected_delayed
 
 
 @pytest.mark.usefixtures('indexed_123')

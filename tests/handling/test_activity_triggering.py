@@ -153,36 +153,36 @@ async def test_retries_are_simulated(settings, activity, mocker):
     assert mock.call_count == 3
 
 
-@pytest.mark.parametrize('activity', list(Activity))
-async def test_delays_are_simulated(settings, activity, mocker):
-
-    def sample_fn(**_):
-        raise TemporaryError('to be retried', delay=123)
-
-    registry = OperatorRegistry()
-    registry._activities.append(ActivityHandler(
-        fn=sample_fn, id='id', activity=activity,
-        param=None, errors=None, timeout=None, retries=3, backoff=None,
-    ))
-
-    with freezegun.freeze_time() as frozen:
-
-        async def sleep_substitute(*_, **__):
-            frozen.tick(123)
-
-        sleep = mocker.patch('kopf._cogs.aiokits.aiotime.sleep', wraps=sleep_substitute)
-
-        with pytest.raises(ActivityError) as e:
-            await run_activity(
-                registry=registry,
-                settings=settings,
-                activity=activity,
-                lifecycle=all_at_once,
-                indices=OperatorIndexers().indices,
-                memo=Memo(),
-            )
-
-    assert sleep.call_count >= 3  # 3 retries, 1 sleep each
-    assert sleep.call_count <= 4  # 3 retries, 1 final success (delay=None), not more
-    if sleep.call_count > 3:
-        sleep.call_args_list[-1][0][0] is None
+# @pytest.mark.parametrize('activity', list(Activity))
+# async def test_delays_are_simulated(settings, activity, mocker):
+#
+#     def sample_fn(**_):
+#         raise TemporaryError('to be retried', delay=123)
+#
+#     registry = OperatorRegistry()
+#     registry._activities.append(ActivityHandler(
+#         fn=sample_fn, id='id', activity=activity,
+#         param=None, errors=None, timeout=None, retries=3, backoff=None,
+#     ))
+#
+#     with freezegun.freeze_time() as frozen:
+#
+#         async def sleep_substitute(*_, **__):
+#             frozen.tick(123)
+#
+#         sleep = mocker.patch('kopf._cogs.aiokits.aiotime.sleep', wraps=sleep_substitute)
+#
+#         with pytest.raises(ActivityError) as e:
+#             await run_activity(
+#                 registry=registry,
+#                 settings=settings,
+#                 activity=activity,
+#                 lifecycle=all_at_once,
+#                 indices=OperatorIndexers().indices,
+#                 memo=Memo(),
+#             )
+#
+#     assert sleep.call_count >= 3  # 3 retries, 1 sleep each
+#     assert sleep.call_count <= 4  # 3 retries, 1 final success (delay=None), not more
+#     if sleep.call_count > 3:
+#         sleep.call_args_list[-1][0][0] is None

@@ -86,7 +86,6 @@ class Outcome:
     subrefs: Collection[ids.HandlerId] = ()
 
 
-@dataclasses.dataclass(frozen=True)
 class HandlerState:
     """
     A persisted state of a single handler, as stored on the resource's status.
@@ -105,9 +104,9 @@ class HandlerState:
     # started: Optional[float] = None  # None means this information was lost.
     # stopped: Optional[float] = None  # None means it is still running (e.g. delayed).
     # delayed: Optional[float] = None  # None means it is finished (succeeded/failed).
-    retries: int = 0
-    success: bool = False
-    failure: bool = False
+    retries: int
+    success: bool
+    failure: bool
 
     @property
     def finished(self) -> bool:
@@ -309,19 +308,20 @@ async def execute_handler_once(
     # Definitely a temporary error, regardless of the error strictness.
     except TemporaryError as e:
         # Maybe false-negative, never false-positive checks to prevent extra cycles & time wasted.
-        lookahead_runtime = (state.runtime + datetime.timedelta(seconds=e.delay)).total_seconds()
+        delay = e.delay or 0
+        lookahead_runtime = (state.runtime + datetime.timedelta(seconds=delay)).total_seconds()
         lookahead_timeout = handler.timeout is not None and lookahead_runtime >= handler.timeout
         lookahead_retries = handler.retries is not None and state.retries + 1 >= handler.retries
         if lookahead_timeout:
-            exc = HandlerTimeoutError(f"{handler} failed temporarily but would time out after "
+            exc_t = HandlerTimeoutError(f"{handler} failed temporarily but would time out after "
                                       f"{handler.timeout} seconds: {str(e) or repr(e)}")
-            logger.error(f"{exc}")  # already formatted
-            return Outcome(final=True, exception=exc, subrefs=subrefs)
+            logger.error(f"{exc_t}")  # already formatted
+            return Outcome(final=True, exception=exc_t, subrefs=subrefs)
         elif lookahead_retries:
-            exc = HandlerRetriesError(f"{handler} failed temporarily but would exceed "
+            exc_r = HandlerRetriesError(f"{handler} failed temporarily but would exceed "
                                       f"{handler.retries} retries: {str(e) or repr(e)}")
-            logger.error(f"{exc}")  # already formatted
-            return Outcome(final=True, exception=exc, subrefs=subrefs)
+            logger.error(f"{exc_r}")  # already formatted
+            return Outcome(final=True, exception=exc_r, subrefs=subrefs)
         else:
             logger.error(f"{handler} failed temporarily: {str(e) or repr(e)}")
             return Outcome(final=the_last_try, exception=e, delay=e.delay, subrefs=subrefs)
@@ -348,15 +348,15 @@ async def execute_handler_once(
             logger.exception(f"{handler} failed with an exception. Will ignore.")
             return Outcome(final=True, subrefs=subrefs)
         elif errors_mode == ErrorsMode.TEMPORARY and lookahead_timeout:
-            exc = HandlerTimeoutError(f"{handler} failed with an exception but would time out after "
+            exc_t = HandlerTimeoutError(f"{handler} failed with an exception but would time out after "
                                       f"{handler.timeout} seconds: {str(e) or repr(e)}")
-            logger.exception(f"{exc}")  # already formatted
-            return Outcome(final=True, exception=exc, subrefs=subrefs)
+            logger.exception(f"{exc_t}")  # already formatted
+            return Outcome(final=True, exception=exc_t, subrefs=subrefs)
         elif errors_mode == ErrorsMode.TEMPORARY and lookahead_retries:
-            exc = HandlerRetriesError(f"{handler} failed with an exception but would exceed "
+            exc_r = HandlerRetriesError(f"{handler} failed with an exception but would exceed "
                                       f"{handler.retries} retries: {str(e) or repr(e)}")
-            logger.exception(f"{exc}")  # already formatted
-            return Outcome(final=True, exception=exc, subrefs=subrefs)
+            logger.exception(f"{exc_r}")  # already formatted
+            return Outcome(final=True, exception=exc_r, subrefs=subrefs)
         elif errors_mode == ErrorsMode.TEMPORARY:
             logger.exception(f"{handler} failed with an exception. Will retry.")
             return Outcome(final=False, exception=e, delay=backoff, subrefs=subrefs)

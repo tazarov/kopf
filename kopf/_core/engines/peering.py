@@ -151,6 +151,7 @@ async def process_peering_event(
     # from other peers that existed a moment earlier, this should not be a problem.
     now = datetime.datetime.utcnow()
     delays = [(peer.deadline - now).total_seconds() for peer in same_peers + prio_peers]
+    print(delays)
     unslept = await aiotime.sleep(delays, wakeup=stream_pressure)
     if unslept is None and delays:
         await touch(
