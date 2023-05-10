@@ -128,6 +128,7 @@ class WebhookServer(webhacks.WebhookContextManager):
             verify_cafile: Optional[StrPath] = None,
             verify_capath: Optional[StrPath] = None,
             verify_cadata: Optional[Union[str, bytes]] = None,
+            service: Optional[reviews.WebhookClientConfigService] = None,
     ) -> None:
         super().__init__()
         self.addr = addr
@@ -147,6 +148,8 @@ class WebhookServer(webhacks.WebhookContextManager):
         self.verify_cafile = verify_cafile
         self.verify_capath = verify_capath
         self.verify_cadata = verify_cadata
+        self.service = service
+        
 
     async def __call__(self, fn: reviews.WebhookFn) -> AsyncIterator[reviews.WebhookClientConfig]:
 
@@ -175,8 +178,10 @@ class WebhookServer(webhacks.WebhookContextManager):
             host = self.host or self.DEFAULT_HOST or self._get_accessible_addr(self.addr)
             url = self._build_url(schema, host, port, self.path or '')
             logger.debug(f"Accessing the webhooks at {url}")
-
-            client_config = reviews.WebhookClientConfig(url=url)
+            if self.service is None:
+                client_config = reviews.WebhookClientConfig(url=url)
+            else:
+                client_config = reviews.WebhookClientConfig(service=self.service)
             if cadata is not None:
                 client_config['caBundle'] = base64.b64encode(cadata).decode('ascii')
 
